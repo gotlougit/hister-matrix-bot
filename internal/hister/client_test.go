@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,12 +56,17 @@ func TestClientIndexURLRetriesOnServerError(t *testing.T) {
 		if r.Method != http.MethodPost {
 			return &http.Response{StatusCode: http.StatusMethodNotAllowed, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
 		}
-
-		var payload struct {
-			URL string `json:"url"`
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("unexpected content-type: %q", got)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.URL == "" {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm() error = %v", err)
+		}
+		if r.PostForm.Get("url") == "" {
 			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+		}
+		if r.PostForm.Get("title") != "" || r.PostForm.Get("text") != "" {
+			t.Fatalf("expected first attempt to include only url, got title=%q text=%q", r.PostForm.Get("title"), r.PostForm.Get("text"))
 		}
 
 		status := http.StatusInternalServerError
@@ -83,6 +89,93 @@ func TestClientIndexURLRetriesOnServerError(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("IndexURL() attempts = %d, want 3", got)
+	}
+}
+
+func TestClientIndexURLRequiresCreatedStatus(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/add" {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+		}
+		if r.Method != http.MethodPost {
+			return &http.Response{StatusCode: http.StatusMethodNotAllowed, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})
+
+	c, err := NewClient("https://hister.local", 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+
+	err = c.IndexURL(context.Background(), "https://example.com/a")
+	if err == nil {
+		t.Fatal("IndexURL() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "status 200") {
+		t.Fatalf("IndexURL() error = %v, want status 200 in message", err)
+	}
+}
+
+func TestClientIndexURLFallsBackWhenNoTextFound(t *testing.T) {
+	t.Parallel()
+
+	inputURL := "https://example.com/path?q=1"
+
+	var attempts atomic.Int32
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/add" {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+		}
+
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("unexpected content-type: %q", got)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm() error = %v", err)
+		}
+		rawURL := r.PostForm.Get("url")
+		title := r.PostForm.Get("title")
+		text := r.PostForm.Get("text")
+
+		switch attempts.Add(1) {
+		case 1:
+			if rawURL == "" {
+				t.Fatalf("first request missing url payload")
+			}
+			if title != "" || text != "" {
+				t.Fatalf("first request should not include fallback title/text, got title=%q text=%q", title, text)
+			}
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(bytes.NewBufferString("failed to process document error=\"no text found\"")),
+				Header:     make(http.Header),
+			}, nil
+		case 2:
+			if title != rawURL || text != rawURL {
+				t.Fatalf("fallback request should include url for title/text, got url=%q title=%q text=%q", rawURL, title, text)
+			}
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+		default:
+			t.Fatalf("unexpected extra request attempt: %d", attempts.Load())
+			return nil, nil
+		}
+	})
+
+	c, err := NewClient("https://hister.local", 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+
+	if err := c.IndexURL(context.Background(), inputURL); err != nil {
+		t.Fatalf("IndexURL() error = %v", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("IndexURL() attempts = %d, want 2", got)
 	}
 }
 

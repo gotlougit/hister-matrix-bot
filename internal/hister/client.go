@@ -1,7 +1,6 @@
 package hister
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -90,19 +89,71 @@ func (c *Client) IndexURL(ctx context.Context, rawURL string) error {
 		return err
 	}
 
-	body, err := json.Marshal(struct {
-		URL string `json:"url"`
-	}{URL: rawURL})
-	if err != nil {
-		return fmt.Errorf("marshal add payload: %w", err)
+	err = c.addDocument(ctx, endpoint, addRequest{
+		URL: rawURL,
+	})
+	if err == nil {
+		return nil
 	}
 
+	if shouldFallbackToInlineText(err) {
+		fallbackErr := c.addDocument(ctx, endpoint, addRequest{
+			URL:   rawURL,
+			Title: rawURL,
+			Text:  rawURL,
+		})
+		if fallbackErr == nil {
+			return nil
+		}
+		return fallbackErr
+	}
+
+	return err
+}
+
+type addRequest struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Text  string `json:"text,omitempty"`
+}
+
+type addStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *addStatusError) Error() string {
+	if strings.TrimSpace(e.Body) == "" {
+		return fmt.Sprintf("add request failed with status %d (expected %d)", e.StatusCode, http.StatusCreated)
+	}
+	return fmt.Sprintf("add request failed with status %d (expected %d): %s", e.StatusCode, http.StatusCreated, e.Body)
+}
+
+func shouldFallbackToInlineText(err error) bool {
+	var addErr *addStatusError
+	if !errors.As(err, &addErr) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(addErr.Body), "no text found")
+}
+
+func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRequest) error {
+	form := url.Values{}
+	form.Set("url", payload.URL)
+	if strings.TrimSpace(payload.Title) != "" {
+		form.Set("title", payload.Title)
+	}
+	if strings.TrimSpace(payload.Text) != "" {
+		form.Set("text", payload.Text)
+	}
+	body := form.Encode()
+
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("create add request: %w", err)
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		resp, err := c.HTTPClient.Do(req)
 		if err != nil {
@@ -118,8 +169,15 @@ func (c *Client) IndexURL(ctx context.Context, rawURL string) error {
 			return fmt.Errorf("add request failed after %d attempts: %w", attempt+1, err)
 		}
 
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated && strings.Contains(strings.ToLower(string(respBody)), "no text found") {
+			return &addStatusError{
+				StatusCode: resp.StatusCode,
+				Body:       strings.TrimSpace(string(respBody)),
+			}
+		}
 
 		if resp.StatusCode >= 500 {
 			if attempt < c.AddRetries {
@@ -131,8 +189,11 @@ func (c *Client) IndexURL(ctx context.Context, rawURL string) error {
 			return fmt.Errorf("add request failed with status %d", resp.StatusCode)
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("add request failed with status %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusCreated {
+			return &addStatusError{
+				StatusCode: resp.StatusCode,
+				Body:       strings.TrimSpace(string(respBody)),
+			}
 		}
 		return nil
 	}
