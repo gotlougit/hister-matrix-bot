@@ -1,6 +1,12 @@
-# Hister Matrix Bot (PoC)
+# Hister Matrix Bot
 
-Matrix bot that listens in allowlisted rooms, indexes URLs into Hister, and replies to search triggers with threaded top results.
+Matrix bot that listens in allowlisted rooms, indexes URLs into [Hister](https://github.com/asciimoo/hister), and replies to search triggers with threaded top results.
+
+## Disclaimer
+
+This is a vibe coded experiment! It is meant to be secure, but MAY NOT be!
+Self-host it, with as little permission as possible granted to it.
+Be prepared to wipe it off the face of the Earth if needed.
 
 ## What it does
 
@@ -63,14 +69,14 @@ Example `/etc/hister-matrix-bot/bot.env`:
 ```bash
 MATRIX_BOT_CONFIG=/etc/hister-matrix-bot/config.yaml
 MATRIX_PICKLE_KEY=replace-with-random-secret
+# For automatic new-device recovery (first time ONLY!):
+MATRIX_BOT_PASSWORD=replace-with-bot-password
 
 # Optional for automatic trust bootstrap:
 # MATRIX_RECOVERY_KEY=...
 # or
 # MATRIX_RECOVERY_PASSPHRASE=...
 
-# Optional for automatic new-device recovery if crypto state is inconsistent:
-# MATRIX_BOT_PASSWORD=...
 # MATRIX_BOT_NEW_DEVICE_ID=BOTDEVICE2
 ```
 
