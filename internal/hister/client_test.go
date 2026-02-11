@@ -59,14 +59,20 @@ func TestClientIndexURLRetriesOnServerError(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
 			t.Fatalf("unexpected content-type: %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got != "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0" {
+			t.Fatalf("unexpected user-agent: %q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" {
+			t.Fatalf("unexpected accept: %q", got)
+		}
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("ParseForm() error = %v", err)
 		}
 		if r.PostForm.Get("url") == "" {
 			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
 		}
-		if r.PostForm.Get("title") != "" || r.PostForm.Get("text") != "" {
-			t.Fatalf("expected first attempt to include only url, got title=%q text=%q", r.PostForm.Get("title"), r.PostForm.Get("text"))
+		if r.PostForm.Get("title") != "example" || r.PostForm.Get("text") != "example" {
+			t.Fatalf("expected title/text to be domain label, got title=%q text=%q", r.PostForm.Get("title"), r.PostForm.Get("text"))
 		}
 
 		status := http.StatusInternalServerError
@@ -120,12 +126,10 @@ func TestClientIndexURLRequiresCreatedStatus(t *testing.T) {
 	}
 }
 
-func TestClientIndexURLFallsBackWhenNoTextFound(t *testing.T) {
+func TestClientIndexURLSendsDomainLabelForSubdomain(t *testing.T) {
 	t.Parallel()
 
-	inputURL := "https://example.com/path?q=1"
-
-	var attempts atomic.Int32
+	inputURL := "https://x.y.z.gotlou.com/path?q=1"
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/add" {
 			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
@@ -141,28 +145,13 @@ func TestClientIndexURLFallsBackWhenNoTextFound(t *testing.T) {
 		title := r.PostForm.Get("title")
 		text := r.PostForm.Get("text")
 
-		switch attempts.Add(1) {
-		case 1:
-			if rawURL == "" {
-				t.Fatalf("first request missing url payload")
-			}
-			if title != "" || text != "" {
-				t.Fatalf("first request should not include fallback title/text, got title=%q text=%q", title, text)
-			}
-			return &http.Response{
-				StatusCode: http.StatusInternalServerError,
-				Body:       io.NopCloser(bytes.NewBufferString("failed to process document error=\"no text found\"")),
-				Header:     make(http.Header),
-			}, nil
-		case 2:
-			if title != rawURL || text != rawURL {
-				t.Fatalf("fallback request should include url for title/text, got url=%q title=%q text=%q", rawURL, title, text)
-			}
-			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
-		default:
-			t.Fatalf("unexpected extra request attempt: %d", attempts.Load())
-			return nil, nil
+		if rawURL != inputURL {
+			t.Fatalf("unexpected url payload: got %q want %q", rawURL, inputURL)
 		}
+		if title != "gotlou" || text != "gotlou" {
+			t.Fatalf("expected title/text to equal registrable domain label, got title=%q text=%q", title, text)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
 	})
 
 	c, err := NewClient("https://hister.local", 2*time.Second)
@@ -173,9 +162,6 @@ func TestClientIndexURLFallsBackWhenNoTextFound(t *testing.T) {
 
 	if err := c.IndexURL(context.Background(), inputURL); err != nil {
 		t.Fatalf("IndexURL() error = %v", err)
-	}
-	if got := attempts.Load(); got != 2 {
-		t.Fatalf("IndexURL() attempts = %d, want 2", got)
 	}
 }
 

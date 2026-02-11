@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -89,26 +90,12 @@ func (c *Client) IndexURL(ctx context.Context, rawURL string) error {
 		return err
 	}
 
-	err = c.addDocument(ctx, endpoint, addRequest{
-		URL: rawURL,
+	title := extractTitleFromURL(rawURL)
+	return c.addDocument(ctx, endpoint, addRequest{
+		URL:   rawURL,
+		Title: title,
+		Text:  title,
 	})
-	if err == nil {
-		return nil
-	}
-
-	if shouldFallbackToInlineText(err) {
-		fallbackErr := c.addDocument(ctx, endpoint, addRequest{
-			URL:   rawURL,
-			Title: rawURL,
-			Text:  rawURL,
-		})
-		if fallbackErr == nil {
-			return nil
-		}
-		return fallbackErr
-	}
-
-	return err
 }
 
 type addRequest struct {
@@ -129,14 +116,6 @@ func (e *addStatusError) Error() string {
 	return fmt.Sprintf("add request failed with status %d (expected %d): %s", e.StatusCode, http.StatusCreated, e.Body)
 }
 
-func shouldFallbackToInlineText(err error) bool {
-	var addErr *addStatusError
-	if !errors.As(err, &addErr) {
-		return false
-	}
-	return strings.Contains(strings.ToLower(addErr.Body), "no text found")
-}
-
 func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRequest) error {
 	form := url.Values{}
 	form.Set("url", payload.URL)
@@ -154,6 +133,8 @@ func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRe
 			return fmt.Errorf("create add request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 		resp, err := c.HTTPClient.Do(req)
 		if err != nil {
@@ -171,13 +152,6 @@ func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRe
 
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
-
-		if resp.StatusCode != http.StatusCreated && strings.Contains(strings.ToLower(string(respBody)), "no text found") {
-			return &addStatusError{
-				StatusCode: resp.StatusCode,
-				Body:       strings.TrimSpace(string(respBody)),
-			}
-		}
 
 		if resp.StatusCode >= 500 {
 			if attempt < c.AddRetries {
@@ -197,6 +171,36 @@ func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRe
 		}
 		return nil
 	}
+}
+
+func extractTitleFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return strings.TrimSpace(rawURL)
+	}
+
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return strings.TrimSpace(rawURL)
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return host
+	}
+
+	baseDomain, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil {
+		baseDomain = host
+	}
+
+	label := strings.TrimSpace(baseDomain)
+	if idx := strings.Index(label, "."); idx > 0 {
+		label = label[:idx]
+	}
+	if label == "" {
+		return host
+	}
+	return label
 }
 
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
