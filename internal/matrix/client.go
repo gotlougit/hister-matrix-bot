@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -168,7 +169,9 @@ func NewClient(
 
 	syncer := ensureDefaultSyncer(mx)
 	syncer.OnEventType(event.EventMessage, c.onMessageEvent)
-	syncer.OnEventType(event.EventEncrypted, c.onEncryptedEvent)
+	if !usesCryptoHelperAutoDecrypt(mx.Crypto) {
+		syncer.OnEventType(event.EventEncrypted, c.onEncryptedEvent)
+	}
 
 	return c, nil
 }
@@ -272,6 +275,14 @@ func ensureDefaultSyncer(mx *mautrix.Client) *mautrix.DefaultSyncer {
 	syncer.ParseEventContent = true
 	mx.Syncer = syncer
 	return syncer
+}
+
+func usesCryptoHelperAutoDecrypt(decrypter EventDecrypter) bool {
+	if decrypter == nil {
+		return false
+	}
+	_, ok := decrypter.(*cryptohelper.CryptoHelper)
+	return ok
 }
 
 func (c *Client) logf(format string, args ...any) {

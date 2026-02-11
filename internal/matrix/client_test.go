@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -47,10 +49,31 @@ func (f *fakeHandler) HandleMatrixMessage(_ context.Context, msg Message) error 
 type fakeCrypto struct {
 	decrypted *event.Event
 	err       error
+	calls     int
 }
 
 func (f *fakeCrypto) Decrypt(_ context.Context, _ *event.Event) (*event.Event, error) {
+	f.calls++
 	return f.decrypted, f.err
+}
+
+type fakeMautrixCrypto struct {
+	fakeCrypto
+}
+
+func (f *fakeMautrixCrypto) Encrypt(context.Context, id.RoomID, event.Type, any) (*event.EncryptedEventContent, error) {
+	return nil, nil
+}
+
+func (f *fakeMautrixCrypto) WaitForSession(context.Context, id.RoomID, id.SenderKey, id.SessionID, time.Duration) bool {
+	return false
+}
+
+func (f *fakeMautrixCrypto) RequestSession(context.Context, id.RoomID, id.SenderKey, id.SessionID, id.UserID, id.DeviceID) {
+}
+
+func (f *fakeMautrixCrypto) Init(context.Context) error {
+	return nil
 }
 
 func TestSendReply_Threaded(t *testing.T) {
@@ -116,6 +139,76 @@ func TestOnEncryptedEvent_DecryptsAndForwards(t *testing.T) {
 	c.onEncryptedEvent(context.Background(), &event.Event{Type: event.EventEncrypted, RoomID: "!allowed:test", ID: "$enc"})
 	if len(handler.msgs) != 1 || handler.msgs[0].Body != "secret" {
 		t.Fatalf("expected decrypted message to be forwarded, got %#v", handler.msgs)
+	}
+}
+
+func TestNewClient_RegistersEncryptedFallbackWhenNotUsingCryptoHelper(t *testing.T) {
+	mx, err := mautrix.NewClient("https://example.com", "@bot:test", "token")
+	if err != nil {
+		t.Fatalf("create mautrix client: %v", err)
+	}
+
+	handler := &fakeHandler{}
+	dec := &event.Event{
+		Type:    event.EventMessage,
+		RoomID:  "!allowed:test",
+		ID:      "$d",
+		Sender:  "@alice:test",
+		Content: event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "secret"}},
+	}
+	fake := &fakeMautrixCrypto{fakeCrypto: fakeCrypto{decrypted: dec}}
+	mx.Crypto = fake
+
+	_, err = NewClient(mx, AllowedRooms{"!allowed:test": {}}, handler, nil)
+	if err != nil {
+		t.Fatalf("new matrix client: %v", err)
+	}
+
+	syncer := mx.Syncer.(*mautrix.DefaultSyncer)
+	syncer.Dispatch(context.Background(), &event.Event{
+		Type:   event.EventEncrypted,
+		RoomID: "!allowed:test",
+		ID:     "$enc",
+		Sender: "@alice:test",
+	})
+
+	if fake.calls != 1 {
+		t.Fatalf("expected encrypted fallback decrypt call count 1, got %d", fake.calls)
+	}
+	if len(handler.msgs) != 1 || handler.msgs[0].Body != "secret" {
+		t.Fatalf("expected decrypted message to be forwarded, got %#v", handler.msgs)
+	}
+}
+
+func TestNewClient_DoesNotRegisterEncryptedFallbackWithCryptoHelper(t *testing.T) {
+	mx, err := mautrix.NewClient("https://example.com", "@bot:test", "token")
+	if err != nil {
+		t.Fatalf("create mautrix client: %v", err)
+	}
+	mx.Crypto = &cryptohelper.CryptoHelper{}
+
+	handler := &fakeHandler{}
+	_, err = NewClient(mx, AllowedRooms{"!allowed:test": {}}, handler, nil)
+	if err != nil {
+		t.Fatalf("new matrix client: %v", err)
+	}
+
+	syncer := mx.Syncer.(*mautrix.DefaultSyncer)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("dispatch panicked; encrypted fallback was unexpectedly invoked: %v", recovered)
+		}
+	}()
+
+	syncer.Dispatch(context.Background(), &event.Event{
+		Type:   event.EventEncrypted,
+		RoomID: "!allowed:test",
+		ID:     "$enc",
+		Sender: "@alice:test",
+	})
+
+	if len(handler.msgs) != 0 {
+		t.Fatalf("expected no forwarded messages, got %#v", handler.msgs)
 	}
 }
 
