@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/gotlou/hister-element-bot/bot/internal/extractor"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -71,8 +72,8 @@ func TestClientIndexURLRetriesOnServerError(t *testing.T) {
 		if r.PostForm.Get("url") == "" {
 			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
 		}
-		if r.PostForm.Get("title") != "example" || r.PostForm.Get("text") != "example" {
-			t.Fatalf("expected title/text to be domain label, got title=%q text=%q", r.PostForm.Get("title"), r.PostForm.Get("text"))
+		if r.PostForm.Get("title") != "Example Title" || r.PostForm.Get("text") != "Example body text" {
+			t.Fatalf("expected extracted title/text, got title=%q text=%q", r.PostForm.Get("title"), r.PostForm.Get("text"))
 		}
 
 		status := http.StatusInternalServerError
@@ -87,6 +88,9 @@ func TestClientIndexURLRetriesOnServerError(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	c.Extract = func(context.Context, string) (extractor.Result, error) {
+		return extractor.Result{Title: "Example Title", Text: "Example body text"}, nil
+	}
 	c.RetryBackoff = 5 * time.Millisecond
 	c.MaxRetryBackoff = 5 * time.Millisecond
 
@@ -116,6 +120,9 @@ func TestClientIndexURLRequiresCreatedStatus(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	c.Extract = func(context.Context, string) (extractor.Result, error) {
+		return extractor.Result{Title: "Example Title", Text: "Example body text"}, nil
+	}
 
 	err = c.IndexURL(context.Background(), "https://example.com/a")
 	if err == nil {
@@ -126,7 +133,7 @@ func TestClientIndexURLRequiresCreatedStatus(t *testing.T) {
 	}
 }
 
-func TestClientIndexURLSendsDomainLabelForSubdomain(t *testing.T) {
+func TestClientIndexURLSendsExtractedContent(t *testing.T) {
 	t.Parallel()
 
 	inputURL := "https://x.y.z.gotlou.com/path?q=1"
@@ -148,8 +155,8 @@ func TestClientIndexURLSendsDomainLabelForSubdomain(t *testing.T) {
 		if rawURL != inputURL {
 			t.Fatalf("unexpected url payload: got %q want %q", rawURL, inputURL)
 		}
-		if title != "gotlou" || text != "gotlou" {
-			t.Fatalf("expected title/text to equal registrable domain label, got title=%q text=%q", title, text)
+		if title != "Gotlou docs" || text != "Go docs and examples" {
+			t.Fatalf("expected extracted title/text, got title=%q text=%q", title, text)
 		}
 		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
 	})
@@ -159,9 +166,44 @@ func TestClientIndexURLSendsDomainLabelForSubdomain(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	c.Extract = func(context.Context, string) (extractor.Result, error) {
+		return extractor.Result{Title: "Gotlou docs", Text: "Go docs and examples"}, nil
+	}
 
 	if err := c.IndexURL(context.Background(), inputURL); err != nil {
 		t.Fatalf("IndexURL() error = %v", err)
+	}
+}
+
+func TestClientIndexURLReturnsExtractorError(t *testing.T) {
+	t.Parallel()
+
+	var addCalls atomic.Int32
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/add" {
+			addCalls.Add(1)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})
+
+	c, err := NewClient("https://hister.local", 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.HTTPClient = &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	c.Extract = func(context.Context, string) (extractor.Result, error) {
+		return extractor.Result{}, errors.New("fetch failed")
+	}
+
+	err = c.IndexURL(context.Background(), "https://example.com/a")
+	if err == nil {
+		t.Fatal("IndexURL() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "extract URL content") {
+		t.Fatalf("IndexURL() error = %v, want extract URL content", err)
+	}
+	if got := addCalls.Load(); got != 0 {
+		t.Fatalf("add request calls = %d, want 0", got)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/publicsuffix"
+	"github.com/gotlou/hister-element-bot/bot/internal/extractor"
 )
 
 const (
@@ -55,6 +55,7 @@ type Client struct {
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
 	DialWS     func(ctx context.Context, wsURL string) (wsConn, error)
+	Extract    func(ctx context.Context, rawURL string) (extractor.Result, error)
 }
 
 type wsConn interface {
@@ -90,11 +91,15 @@ func (c *Client) IndexURL(ctx context.Context, rawURL string) error {
 		return err
 	}
 
-	title := extractTitleFromURL(rawURL)
+	content, err := c.Extract(ctx, rawURL)
+	if err != nil {
+		return fmt.Errorf("extract URL content: %w", err)
+	}
+
 	return c.addDocument(ctx, endpoint, addRequest{
 		URL:   rawURL,
-		Title: title,
-		Text:  title,
+		Title: content.Title,
+		Text:  content.Text,
 	})
 }
 
@@ -171,36 +176,6 @@ func (c *Client) addDocument(ctx context.Context, endpoint string, payload addRe
 		}
 		return nil
 	}
-}
-
-func extractTitleFromURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return strings.TrimSpace(rawURL)
-	}
-
-	host := strings.TrimSpace(u.Hostname())
-	if host == "" {
-		return strings.TrimSpace(rawURL)
-	}
-
-	if ip := net.ParseIP(host); ip != nil {
-		return host
-	}
-
-	baseDomain, err := publicsuffix.EffectiveTLDPlusOne(host)
-	if err != nil {
-		baseDomain = host
-	}
-
-	label := strings.TrimSpace(baseDomain)
-	if idx := strings.Index(label, "."); idx > 0 {
-		label = label[:idx]
-	}
-	if label == "" {
-		return host
-	}
-	return label
 }
 
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
@@ -479,6 +454,11 @@ func (c *Client) applyDefaults() {
 		c.HTTPClient = &http.Client{Timeout: c.Timeout}
 	} else if c.HTTPClient.Timeout == 0 {
 		c.HTTPClient.Timeout = c.Timeout
+	}
+	if c.Extract == nil {
+		c.Extract = func(ctx context.Context, rawURL string) (extractor.Result, error) {
+			return extractor.ExtractFromURL(ctx, c.HTTPClient, rawURL)
+		}
 	}
 
 	if c.Dialer == nil {
