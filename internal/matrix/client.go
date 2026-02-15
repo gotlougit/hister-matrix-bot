@@ -99,6 +99,8 @@ type matrixAPI interface {
 		contentJSON any,
 		extra ...mautrix.ReqSendEvent,
 	) (*mautrix.RespSendEvent, error)
+	StateEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string, outContent interface{}) error
+	JoinedMembers(ctx context.Context, roomID id.RoomID) (*mautrix.RespJoinedMembers, error)
 	Messages(ctx context.Context, roomID id.RoomID, from, to string, dir mautrix.Direction, filter *mautrix.FilterPart, limit int) (*mautrix.RespMessages, error)
 	SyncWithContext(ctx context.Context) error
 	StopSync()
@@ -107,6 +109,9 @@ type matrixAPI interface {
 type Client struct {
 	api        matrixAPI
 	crypto     EventDecrypter
+	resetGroup func(ctx context.Context, roomID id.RoomID) error
+	shareGroup func(ctx context.Context, roomID id.RoomID, users []id.UserID) error
+	stateStore mautrix.StateStore
 	roomPolicy RoomPolicy
 	handler    MessageHandler
 	logger     Logger
@@ -162,13 +167,19 @@ func NewClient(
 	c := &Client{
 		api:        mx,
 		crypto:     mx.Crypto,
+		stateStore: mx.StateStore,
 		roomPolicy: roomPolicy,
 		handler:    handler,
 		logger:     logger,
 		botUserID:  mx.UserID,
 	}
+	if helper, ok := mx.Crypto.(*cryptohelper.CryptoHelper); ok {
+		c.resetGroup = helper.Machine().CryptoStore.RemoveOutboundGroupSession
+		c.shareGroup = helper.Machine().ShareGroupSession
+	}
 
 	syncer := ensureDefaultSyncer(mx)
+	syncer.OnEvent(mx.StateStoreSyncHandler)
 	syncer.OnEventType(event.EventMessage, c.onMessageEvent)
 	if !usesCryptoHelperAutoDecrypt(mx.Crypto) {
 		syncer.OnEventType(event.EventEncrypted, c.onEncryptedEvent)
@@ -193,6 +204,15 @@ func (c *Client) SendReply(ctx context.Context, reply Reply) error {
 	if body == "" {
 		return errors.New("reply body must not be empty")
 	}
+	if err := c.ensureRoomEncryptionState(ctx, reply.RoomID); err != nil {
+		return err
+	}
+	if err := c.ensureRoomMembersForEncryption(ctx, reply.RoomID); err != nil {
+		return err
+	}
+	if err := c.ensureGroupSessionForEncryption(ctx, reply.RoomID); err != nil {
+		return err
+	}
 
 	content := &event.MessageEventContent{
 		MsgType: event.MsgNotice,
@@ -211,6 +231,75 @@ func (c *Client) SendReply(ctx context.Context, reply Reply) error {
 	_, err := c.api.SendMessageEvent(ctx, reply.RoomID, event.EventMessage, content)
 	if err != nil {
 		return fmt.Errorf("send matrix reply: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) ensureRoomEncryptionState(ctx context.Context, roomID id.RoomID) error {
+	var encryption event.EncryptionEventContent
+	err := c.api.StateEvent(ctx, roomID, event.StateEncryption, "", &encryption)
+	if err == nil || errors.Is(err, mautrix.MNotFound) {
+		return nil
+	}
+	return fmt.Errorf("resolve room encryption state: %w", err)
+}
+
+func (c *Client) ensureRoomMembersForEncryption(ctx context.Context, roomID id.RoomID) error {
+	if c.crypto == nil || c.stateStore == nil {
+		return nil
+	}
+
+	encrypted, err := c.stateStore.IsEncrypted(ctx, roomID)
+	if err != nil {
+		return fmt.Errorf("check room encryption state: %w", err)
+	}
+	if !encrypted {
+		return nil
+	}
+
+	fetched, err := c.stateStore.HasFetchedMembers(ctx, roomID)
+	if err != nil {
+		return fmt.Errorf("check room member cache: %w", err)
+	}
+	if fetched {
+		return nil
+	}
+
+	if _, err = c.api.JoinedMembers(ctx, roomID); err != nil {
+		return fmt.Errorf("fetch joined members for encryption: %w", err)
+	}
+	c.logf("fetched joined members for encrypted room=%s", roomID)
+	return nil
+}
+
+func (c *Client) ensureGroupSessionForEncryption(ctx context.Context, roomID id.RoomID) error {
+	if c.crypto == nil || c.stateStore == nil || c.shareGroup == nil {
+		return nil
+	}
+	encrypted, err := c.stateStore.IsEncrypted(ctx, roomID)
+	if err != nil {
+		return fmt.Errorf("check room encryption state for group session: %w", err)
+	}
+	if !encrypted {
+		return nil
+	}
+	users, err := c.stateStore.GetRoomJoinedOrInvitedMembers(ctx, roomID)
+	if err != nil {
+		return fmt.Errorf("load room members for group session: %w", err)
+	}
+	if len(users) == 0 {
+		c.logf("no joined/invited members in state store for encrypted room=%s; skipping explicit group share", roomID)
+		return nil
+	}
+	if c.resetGroup != nil {
+		c.logf("rotating outbound group session room=%s before explicit share", roomID)
+		if err := c.resetGroup(ctx, roomID); err != nil {
+			return fmt.Errorf("rotate outbound group session: %w", err)
+		}
+	}
+	c.logf("sharing group session room=%s users=%d", roomID, len(users))
+	if err := c.shareGroup(ctx, roomID, users); err != nil {
+		return fmt.Errorf("share group session: %w", err)
 	}
 	return nil
 }

@@ -17,6 +17,14 @@ type fakeAPI struct {
 	sentRoomID   id.RoomID
 	sentType     event.Type
 	sentContent  any
+	stateRoomID  id.RoomID
+	stateType    event.Type
+	stateKey     string
+	stateOut     any
+	stateCalls   int
+	stateErr     error
+	joinedCalls  int
+	joinedErr    error
 	messagesResp *mautrix.RespMessages
 	messagePages []*mautrix.RespMessages
 	messagesErr  error
@@ -41,6 +49,21 @@ func (f *fakeAPI) SendMessageEvent(
 
 func (f *fakeAPI) SyncWithContext(context.Context) error { return f.syncErr }
 func (f *fakeAPI) StopSync()                             { f.stopped = true }
+func (f *fakeAPI) StateEvent(_ context.Context, roomID id.RoomID, eventType event.Type, stateKey string, outContent interface{}) error {
+	f.stateRoomID = roomID
+	f.stateType = eventType
+	f.stateKey = stateKey
+	f.stateOut = outContent
+	f.stateCalls++
+	return f.stateErr
+}
+func (f *fakeAPI) JoinedMembers(_ context.Context, _ id.RoomID) (*mautrix.RespJoinedMembers, error) {
+	f.joinedCalls++
+	if f.joinedErr != nil {
+		return nil, f.joinedErr
+	}
+	return &mautrix.RespJoinedMembers{}, nil
+}
 func (f *fakeAPI) Messages(_ context.Context, _ id.RoomID, from, _ string, _ mautrix.Direction, _ *mautrix.FilterPart, limit int) (*mautrix.RespMessages, error) {
 	f.messagesFrom = append(f.messagesFrom, from)
 	f.messagesLim = append(f.messagesLim, limit)
@@ -147,6 +170,139 @@ func TestSendReply_EmptyBody(t *testing.T) {
 	}
 }
 
+func TestSendReply_IgnoresMissingEncryptionState(t *testing.T) {
+	api := &fakeAPI{stateErr: mautrix.MNotFound}
+	c := &Client{api: api, handler: &fakeHandler{}}
+
+	err := c.SendReply(context.Background(), Reply{RoomID: "!room:test", Body: "hello"})
+	if err != nil {
+		t.Fatalf("SendReply failed: %v", err)
+	}
+	if api.stateCalls != 1 || api.stateType != event.StateEncryption {
+		t.Fatalf("expected one encryption state lookup, calls=%d type=%s", api.stateCalls, api.stateType)
+	}
+}
+
+func TestSendReply_FailsWhenEncryptionStateLookupFails(t *testing.T) {
+	api := &fakeAPI{stateErr: errors.New("boom")}
+	c := &Client{api: api, handler: &fakeHandler{}}
+
+	err := c.SendReply(context.Background(), Reply{RoomID: "!room:test", Body: "hello"})
+	if err == nil {
+		t.Fatal("expected SendReply to fail")
+	}
+	if api.sentRoomID != "" || api.sentContent != nil {
+		t.Fatalf("expected no send call after state lookup failure, got room=%s content=%T", api.sentRoomID, api.sentContent)
+	}
+}
+
+func TestSendReply_EncryptedRoomFetchesJoinedMembersWhenMissing(t *testing.T) {
+	api := &fakeAPI{}
+	stateStore := mautrix.NewMemoryStateStore()
+	if err := stateStore.SetEncryptionEvent(context.Background(), "!room:test", &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}); err != nil {
+		t.Fatalf("SetEncryptionEvent failed: %v", err)
+	}
+
+	c := &Client{
+		api:        api,
+		handler:    &fakeHandler{},
+		crypto:     &fakeCrypto{},
+		stateStore: stateStore,
+	}
+	err := c.SendReply(context.Background(), Reply{RoomID: "!room:test", Body: "hello"})
+	if err != nil {
+		t.Fatalf("SendReply failed: %v", err)
+	}
+	if api.joinedCalls != 1 {
+		t.Fatalf("expected one joined_members fetch, got %d", api.joinedCalls)
+	}
+}
+
+func TestSendReply_EncryptedRoomSharesGroupSession(t *testing.T) {
+	api := &fakeAPI{}
+	stateStore := mautrix.NewMemoryStateStore()
+	roomID := id.RoomID("!room:test")
+	if err := stateStore.SetEncryptionEvent(context.Background(), roomID, &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}); err != nil {
+		t.Fatalf("SetEncryptionEvent failed: %v", err)
+	}
+	if err := stateStore.SetMember(context.Background(), roomID, "@alice:test", &event.MemberEventContent{Membership: event.MembershipJoin}); err != nil {
+		t.Fatalf("SetMember failed: %v", err)
+	}
+	if err := stateStore.MarkMembersFetched(context.Background(), roomID); err != nil {
+		t.Fatalf("MarkMembersFetched failed: %v", err)
+	}
+
+	calls := 0
+	c := &Client{
+		api:        api,
+		handler:    &fakeHandler{},
+		crypto:     &fakeCrypto{},
+		stateStore: stateStore,
+		shareGroup: func(_ context.Context, gotRoom id.RoomID, users []id.UserID) error {
+			calls++
+			if gotRoom != roomID {
+				t.Fatalf("unexpected room id in shareGroup: %s", gotRoom)
+			}
+			if len(users) != 1 || users[0] != "@alice:test" {
+				t.Fatalf("unexpected users in shareGroup: %#v", users)
+			}
+			return nil
+		},
+	}
+	err := c.SendReply(context.Background(), Reply{RoomID: roomID, Body: "hello"})
+	if err != nil {
+		t.Fatalf("SendReply failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one shareGroup call, got %d", calls)
+	}
+}
+
+func TestSendReply_EncryptedRoomRotatesSessionBeforeShare(t *testing.T) {
+	api := &fakeAPI{}
+	stateStore := mautrix.NewMemoryStateStore()
+	roomID := id.RoomID("!room:test")
+	if err := stateStore.SetEncryptionEvent(context.Background(), roomID, &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}); err != nil {
+		t.Fatalf("SetEncryptionEvent failed: %v", err)
+	}
+	if err := stateStore.SetMember(context.Background(), roomID, "@alice:test", &event.MemberEventContent{Membership: event.MembershipJoin}); err != nil {
+		t.Fatalf("SetMember failed: %v", err)
+	}
+	if err := stateStore.MarkMembersFetched(context.Background(), roomID); err != nil {
+		t.Fatalf("MarkMembersFetched failed: %v", err)
+	}
+
+	rotated := false
+	shared := false
+	c := &Client{
+		api:        api,
+		handler:    &fakeHandler{},
+		crypto:     &fakeCrypto{},
+		stateStore: stateStore,
+		resetGroup: func(_ context.Context, gotRoom id.RoomID) error {
+			if gotRoom != roomID {
+				t.Fatalf("unexpected room id in resetGroup: %s", gotRoom)
+			}
+			rotated = true
+			return nil
+		},
+		shareGroup: func(_ context.Context, _ id.RoomID, _ []id.UserID) error {
+			if !rotated {
+				t.Fatal("shareGroup called before resetGroup")
+			}
+			shared = true
+			return nil
+		},
+	}
+	err := c.SendReply(context.Background(), Reply{RoomID: roomID, Body: "hello"})
+	if err != nil {
+		t.Fatalf("SendReply failed: %v", err)
+	}
+	if !rotated || !shared {
+		t.Fatalf("expected rotated=%v and shared=%v to both be true", rotated, shared)
+	}
+}
+
 func TestForwardIfMessage_FiltersAndForwards(t *testing.T) {
 	handler := &fakeHandler{}
 	c := &Client{api: &fakeAPI{}, handler: handler, roomPolicy: AllowedRooms{"!allowed:test": {}}, botUserID: "@bot:test"}
@@ -247,6 +403,41 @@ func TestNewClient_DoesNotRegisterEncryptedFallbackWithCryptoHelper(t *testing.T
 
 	if len(handler.msgs) != 0 {
 		t.Fatalf("expected no forwarded messages, got %#v", handler.msgs)
+	}
+}
+
+func TestNewClient_RegistersStateStoreSyncHandler(t *testing.T) {
+	mx, err := mautrix.NewClient("https://example.com", "@bot:test", "token")
+	if err != nil {
+		t.Fatalf("create mautrix client: %v", err)
+	}
+	mx.StateStore = mautrix.NewMemoryStateStore()
+
+	handler := &fakeHandler{}
+	_, err = NewClient(mx, AllowedRooms{"!allowed:test": {}}, handler, nil)
+	if err != nil {
+		t.Fatalf("new matrix client: %v", err)
+	}
+
+	emptyStateKey := ""
+	syncer := mx.Syncer.(*mautrix.DefaultSyncer)
+	syncer.Dispatch(context.Background(), &event.Event{
+		Type:     event.StateEncryption,
+		RoomID:   "!allowed:test",
+		StateKey: &emptyStateKey,
+		Content: event.Content{
+			Parsed: &event.EncryptionEventContent{
+				Algorithm: id.AlgorithmMegolmV1,
+			},
+		},
+	})
+
+	encrypted, err := mx.StateStore.IsEncrypted(context.Background(), "!allowed:test")
+	if err != nil {
+		t.Fatalf("state store IsEncrypted failed: %v", err)
+	}
+	if !encrypted {
+		t.Fatal("expected room to be marked encrypted in state store")
 	}
 }
 
