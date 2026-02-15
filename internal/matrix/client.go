@@ -56,12 +56,6 @@ type Message struct {
 	Body    string
 }
 
-type RoomMessage struct {
-	Sender    id.UserID
-	Body      string
-	Timestamp time.Time
-}
-
 type MessageHandler interface {
 	HandleMatrixMessage(ctx context.Context, msg Message) error
 }
@@ -219,112 +213,6 @@ func (c *Client) SendReply(ctx context.Context, reply Reply) error {
 		return fmt.Errorf("send matrix reply: %w", err)
 	}
 	return nil
-}
-
-func (c *Client) GetRecentTextMessages(ctx context.Context, roomID id.RoomID, since time.Time, max int) ([]RoomMessage, error) {
-	if max <= 0 {
-		return nil, errors.New("max must be greater than zero")
-	}
-	out := make([]RoomMessage, 0, max)
-	// Matrix /messages expects a concrete pagination token. For backward
-	// pagination, "END" starts from the live end of the room timeline.
-	from := "END"
-	pageSize := max
-	if pageSize > 100 {
-		pageSize = 100
-	}
-
-	for len(out) < max {
-		resp, err := c.api.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, pageSize)
-		if err != nil {
-			return nil, fmt.Errorf("fetch room messages: %w", err)
-		}
-		if resp == nil || len(resp.Chunk) == 0 {
-			break
-		}
-
-		reachedBeforeSince := false
-		for _, ev := range resp.Chunk {
-			parsed, ok := c.parseHistoryTextEvent(ctx, ev)
-			if !ok {
-				continue
-			}
-
-			ts := time.UnixMilli(parsed.Timestamp)
-			if ts.Before(since) {
-				// Backward pagination is newest -> oldest. Once we're past the cutoff,
-				// further events are older and won't match either.
-				reachedBeforeSince = true
-				break
-			}
-
-			msg := parsed.Content.AsMessage()
-			if msg == nil {
-				continue
-			}
-			body := strings.TrimSpace(msg.Body)
-			if body == "" {
-				continue
-			}
-			out = append(out, RoomMessage{
-				Sender:    parsed.Sender,
-				Body:      body,
-				Timestamp: ts,
-			})
-			if len(out) >= max {
-				break
-			}
-		}
-
-		if len(out) >= max || reachedBeforeSince {
-			break
-		}
-
-		if resp.End == "" || resp.End == from {
-			break
-		}
-		from = resp.End
-	}
-	return out, nil
-}
-
-func (c *Client) parseHistoryTextEvent(ctx context.Context, ev *event.Event) (*event.Event, bool) {
-	if ev == nil {
-		return nil, false
-	}
-
-	parsed := ev
-	if parsed.Type == event.EventEncrypted {
-		if parsed.Content.Parsed == nil {
-			if err := parsed.Content.ParseRaw(parsed.Type); err != nil && !errors.Is(err, event.ErrContentAlreadyParsed) {
-				c.logf("history parse failed room=%s event=%s err=%v", parsed.RoomID, parsed.ID, err)
-				return nil, false
-			}
-		}
-		if c.crypto == nil {
-			return nil, false
-		}
-		decrypted, err := c.crypto.Decrypt(ctx, parsed)
-		if err != nil {
-			c.logf("history decrypt failed room=%s event=%s err=%v", parsed.RoomID, parsed.ID, err)
-			return nil, false
-		}
-		parsed = decrypted
-	}
-	if parsed == nil || parsed.Type != event.EventMessage {
-		return nil, false
-	}
-	if parsed.Content.Parsed == nil {
-		if err := parsed.Content.ParseRaw(parsed.Type); err != nil && !errors.Is(err, event.ErrContentAlreadyParsed) {
-			c.logf("history parse failed room=%s event=%s err=%v", parsed.RoomID, parsed.ID, err)
-			return nil, false
-		}
-	}
-	msg := parsed.Content.AsMessage()
-	if msg == nil || !msg.MsgType.IsText() {
-		return nil, false
-	}
-	return parsed, true
 }
 
 func (c *Client) onMessageEvent(ctx context.Context, ev *event.Event) {
