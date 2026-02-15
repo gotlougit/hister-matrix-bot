@@ -10,6 +10,7 @@ Build a Matrix bot (using `mautrix/go`) that:
 - `@bot <term>`
 - `<term> @bot`
 - Replies to the triggering message with top-5 compact search results from Hister WebSocket `/search`.
+- Responds to `/catchmeup` by summarizing recent room messages with an LLM.
 
 ## PoC Scope
 In scope:
@@ -19,6 +20,7 @@ In scope:
 - Hister client for indexing and search.
 - Threaded reply formatting.
 - E2EE-capable architecture with persistent crypto/state storage.
+- LLM-backed room catch-up summaries.
 
 Out of scope:
 
@@ -47,6 +49,7 @@ internal/bot/service.go
 internal/matrix/client.go
 internal/triggers/parse.go
 internal/hister/client.go
+internal/llm/llm.go
 internal/storage/store.go
 ```
 
@@ -114,6 +117,7 @@ storage:
 7. `@bot <term>`
 8. `<term> @bot`
 9. If a search trigger exists, call Hister search and reply to the same event thread.
+10. If body is `/catchmeup`, fetch up to 40 room text messages within the previous 24 hours, format as `Speaker: message`, send to LLM, and reply with generated output.
 
 ## Hister API Contract (PoC)
 Index:
@@ -197,4 +201,7 @@ Required from day one:
 - Backend is direct Hister API (`/add`, `/search`).
 - Multi-room support is required; room list is explicit allowlist.
 - Result count default is 5.
+- LLM credentials are provided via environment variables:
+  - `OPENAI_API_KEY`
+  - `OPENAI_BASE_URL`
 - Runtime target is local binary/service first.
