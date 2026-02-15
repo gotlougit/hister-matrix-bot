@@ -12,12 +12,16 @@ The bot:
   - `@bot <term>`
   - `<term> @bot`
 - Replies in-thread with compact top results from Hister WebSocket `/search`.
+- Handles `/catchmeup` by summarizing recent room messages with an LLM.
 
 ## Requirements
 
 - Go `1.23+`
 - Matrix bot account access token
 - Reachable Hister backend with `/add` and `/search`
+- LLM API environment:
+  - `OPENAI_API_KEY`
+  - `OPENAI_BASE_URL`
 
 Use pure-Go olm (`goolm`) and keep `CGO_ENABLED=0` in local commands unless intentionally changing crypto/toolchain behavior.
 
@@ -58,6 +62,7 @@ Important fields by section:
 - URL indexing failures must be logged and must not stop message handling.
 - Invalid or too-long query response: `Invalid search query.`
 - Search backend failure response: `Search failed, please try again.`
+- `/catchmeup` summarizes up to 40 text messages from the previous 24 hours in the room.
 
 ## E2EE Notes
 

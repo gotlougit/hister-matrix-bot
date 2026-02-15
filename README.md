@@ -17,12 +17,16 @@ Be prepared to wipe it off the face of the Earth if needed.
   - `@bot <term>`
   - `<term> @bot`
 - Replies in-thread with compact top results from Hister WebSocket `/search`.
+- Handles `/catchmeup` by summarizing recent room chat with an LLM.
 
 ## Requirements
 
 - Go 1.23+
 - Matrix user access token for the bot account
 - Reachable Hister backend (`/add`, `/search`)
+- LLM API credentials:
+  - `OPENAI_API_KEY`
+  - `OPENAI_BASE_URL`
 
 This project is configured and tested with the pure-Go olm stack (`goolm`) to avoid requiring system `libolm` headers.
 
@@ -78,6 +82,10 @@ MATRIX_BOT_PASSWORD=replace-with-bot-password
 # MATRIX_RECOVERY_PASSPHRASE=...
 
 # MATRIX_BOT_NEW_DEVICE_ID=BOTDEVICE2
+
+# Required for /catchmeup LLM summaries:
+OPENAI_API_KEY=replace-with-api-key
+OPENAI_BASE_URL=https://your-llm-endpoint.example/v1
 ```
 
 ### 3. First startup and crypto bootstrap behavior
@@ -149,6 +157,7 @@ MATRIX_BOT_CONFIG=./config.yaml CGO_ENABLED=0 go run -tags goolm ./cmd/bot
 - URL indexing failures are logged and do not stop message handling.
 - Invalid/too-long queries return: `Invalid search query.`
 - Search backend failures return: `Search failed, please try again.`
+- `/catchmeup` fetches up to 40 text messages from the last 24 hours in the room, formats them as `Speaker: message`, sends them to the configured LLM, and replies with the generated summary.
 
 ## E2EE notes
 

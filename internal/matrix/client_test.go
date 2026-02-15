@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -13,11 +14,16 @@ import (
 )
 
 type fakeAPI struct {
-	sentRoomID  id.RoomID
-	sentType    event.Type
-	sentContent any
-	syncErr     error
-	stopped     bool
+	sentRoomID   id.RoomID
+	sentType     event.Type
+	sentContent  any
+	messagesResp *mautrix.RespMessages
+	messagePages []*mautrix.RespMessages
+	messagesErr  error
+	messagesFrom []string
+	messagesLim  []int
+	syncErr      error
+	stopped      bool
 }
 
 func (f *fakeAPI) SendMessageEvent(
@@ -35,6 +41,22 @@ func (f *fakeAPI) SendMessageEvent(
 
 func (f *fakeAPI) SyncWithContext(context.Context) error { return f.syncErr }
 func (f *fakeAPI) StopSync()                             { f.stopped = true }
+func (f *fakeAPI) Messages(_ context.Context, _ id.RoomID, from, _ string, _ mautrix.Direction, _ *mautrix.FilterPart, limit int) (*mautrix.RespMessages, error) {
+	f.messagesFrom = append(f.messagesFrom, from)
+	f.messagesLim = append(f.messagesLim, limit)
+	if f.messagesErr != nil {
+		return nil, f.messagesErr
+	}
+	if len(f.messagePages) > 0 {
+		resp := f.messagePages[0]
+		f.messagePages = f.messagePages[1:]
+		return resp, nil
+	}
+	if f.messagesResp == nil {
+		return &mautrix.RespMessages{}, nil
+	}
+	return f.messagesResp, nil
+}
 
 type fakeHandler struct {
 	msgs []Message
@@ -55,6 +77,22 @@ type fakeCrypto struct {
 func (f *fakeCrypto) Decrypt(_ context.Context, _ *event.Event) (*event.Event, error) {
 	f.calls++
 	return f.decrypted, f.err
+}
+
+type fakeCryptoNeedsParsedEncrypted struct {
+	decrypted *event.Event
+	calls     int
+}
+
+func (f *fakeCryptoNeedsParsedEncrypted) Decrypt(_ context.Context, ev *event.Event) (*event.Event, error) {
+	f.calls++
+	if ev == nil {
+		return nil, errors.New("nil event")
+	}
+	if _, ok := ev.Content.Parsed.(*event.EncryptedEventContent); !ok {
+		return nil, errors.New("event content is not instance of *event.EncryptedEventContent")
+	}
+	return f.decrypted, nil
 }
 
 type fakeMautrixCrypto struct {
@@ -221,5 +259,107 @@ func TestStartStop(t *testing.T) {
 	c.Stop()
 	if !api.stopped {
 		t.Fatal("expected StopSync to be called")
+	}
+}
+
+func TestGetRecentTextMessages_FiltersByTypeAndTime(t *testing.T) {
+	now := time.Now().UTC()
+	api := &fakeAPI{
+		messagesResp: &mautrix.RespMessages{
+			Chunk: []*event.Event{
+				{Type: event.EventMessage, Sender: "@alice:test", Timestamp: now.Add(-10 * time.Minute).UnixMilli(), Content: event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.text","body":"hello"}`)}},
+				{Type: event.EventMessage, Sender: "@bob:test", Timestamp: now.Add(-26 * time.Hour).UnixMilli(), Content: event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.text","body":"old"}`)}},
+				{Type: event.EventMessage, Sender: "@carol:test", Timestamp: now.Add(-5 * time.Minute).UnixMilli(), Content: event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.image","body":"img"}`)}},
+			},
+		},
+	}
+	c := &Client{api: api, handler: &fakeHandler{}}
+
+	msgs, err := c.GetRecentTextMessages(context.Background(), "!room:test", now.Add(-24*time.Hour), 40)
+	if err != nil {
+		t.Fatalf("GetRecentTextMessages failed: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 recent text message, got %d", len(msgs))
+	}
+	if msgs[0].Sender != "@alice:test" || msgs[0].Body != "hello" {
+		t.Fatalf("unexpected message: %#v", msgs[0])
+	}
+}
+
+func TestGetRecentTextMessages_DecryptsEncryptedEvents(t *testing.T) {
+	now := time.Now().UTC()
+	api := &fakeAPI{
+		messagesResp: &mautrix.RespMessages{
+			Chunk: []*event.Event{
+				{
+					Type:      event.EventEncrypted,
+					RoomID:    "!room:test",
+					ID:        "$enc",
+					Sender:    "@alice:test",
+					Timestamp: now.Add(-3 * time.Minute).UnixMilli(),
+					Content: event.Content{VeryRaw: json.RawMessage(`{
+						"algorithm":"m.megolm.v1.aes-sha2",
+						"ciphertext":"abc",
+						"device_id":"DEVICE",
+						"sender_key":"key",
+						"session_id":"sess"
+					}`)},
+				},
+			},
+		},
+	}
+	crypto := &fakeCryptoNeedsParsedEncrypted{
+		decrypted: &event.Event{
+			Type:      event.EventMessage,
+			RoomID:    "!room:test",
+			ID:        "$dec",
+			Sender:    "@alice:test",
+			Timestamp: now.Add(-3 * time.Minute).UnixMilli(),
+			Content:   event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.text","body":"secret hello"}`)},
+		},
+	}
+	c := &Client{api: api, handler: &fakeHandler{}, crypto: crypto}
+
+	msgs, err := c.GetRecentTextMessages(context.Background(), "!room:test", now.Add(-24*time.Hour), 40)
+	if err != nil {
+		t.Fatalf("GetRecentTextMessages failed: %v", err)
+	}
+	if crypto.calls != 1 {
+		t.Fatalf("expected one decrypt call, got %d", crypto.calls)
+	}
+	if len(msgs) != 1 || msgs[0].Body != "secret hello" {
+		t.Fatalf("unexpected messages: %#v", msgs)
+	}
+}
+
+func TestGetRecentTextMessages_PaginatesToFindMatchingMessages(t *testing.T) {
+	now := time.Now().UTC()
+	api := &fakeAPI{
+		messagePages: []*mautrix.RespMessages{
+			{
+				End: "token-1",
+				Chunk: []*event.Event{
+					{Type: event.EventMessage, Sender: "@alice:test", Timestamp: now.Add(-2 * time.Minute).UnixMilli(), Content: event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.image","body":"img"}`)}},
+				},
+			},
+			{
+				Chunk: []*event.Event{
+					{Type: event.EventMessage, Sender: "@bob:test", Timestamp: now.Add(-5 * time.Minute).UnixMilli(), Content: event.Content{VeryRaw: json.RawMessage(`{"msgtype":"m.text","body":"actual text"}`)}},
+				},
+			},
+		},
+	}
+	c := &Client{api: api, handler: &fakeHandler{}}
+
+	msgs, err := c.GetRecentTextMessages(context.Background(), "!room:test", now.Add(-24*time.Hour), 1)
+	if err != nil {
+		t.Fatalf("GetRecentTextMessages failed: %v", err)
+	}
+	if len(api.messagesFrom) < 2 || api.messagesFrom[0] != "END" || api.messagesFrom[1] != "token-1" {
+		t.Fatalf("unexpected pagination tokens: %#v", api.messagesFrom)
+	}
+	if len(msgs) != 1 || msgs[0].Sender != "@bob:test" || msgs[0].Body != "actual text" {
+		t.Fatalf("unexpected messages: %#v", msgs)
 	}
 }
