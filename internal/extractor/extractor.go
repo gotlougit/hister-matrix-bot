@@ -18,6 +18,17 @@ type Result struct {
 	Text  string
 }
 
+func makeHTTPRequest(ctx context.Context, client *http.Client, rawURL string, acceptHeader string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", acceptHeader)
+	req.Header.Set("User-Agent", "hister-element-bot/1.0")
+
+	return client.Do(req)
+}
+
 func ExtractFromURL(ctx context.Context, httpClient *http.Client, rawURL string) (Result, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
@@ -29,16 +40,15 @@ func ExtractFromURL(ctx context.Context, httpClient *http.Client, rawURL string)
 		client = http.DefaultClient
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return Result{}, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	req.Header.Set("User-Agent", "hister-element-bot/1.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return Result{}, fmt.Errorf("fetch URL: %w", err)
+	resp, err := makeHTTPRequest(ctx, client, rawURL, "text/markdown")
+	if err != nil || (resp != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices)) {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		resp, err = makeHTTPRequest(ctx, client, rawURL, "text/html,application/xhtml+xml")
+		if err != nil {
+			return Result{}, fmt.Errorf("fetch URL: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 

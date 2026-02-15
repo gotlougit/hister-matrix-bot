@@ -58,3 +58,28 @@ func TestExtractFromURLReturnsHTTPError(t *testing.T) {
 		t.Fatalf("ExtractFromURL() error = %v, want status 502", err)
 	}
 }
+
+func TestExtractFromURLFallsBackToHTMLOnMarkdownHTTPError(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "text/markdown") {
+			http.Error(w, "not acceptable", http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><head><title>Fallback Title</title></head><body>Fallback body</body></html>`))
+	}))
+	defer srv.Close()
+
+	got, err := ExtractFromURL(context.Background(), srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatalf("ExtractFromURL() error = %v", err)
+	}
+	if got.Title != "Fallback Title" {
+		t.Fatalf("ExtractFromURL() title = %q, want %q", got.Title, "Fallback Title")
+	}
+	if got.Text != "Fallback body" {
+		t.Fatalf("ExtractFromURL() text = %q, want %q", got.Text, "Fallback body")
+	}
+}
